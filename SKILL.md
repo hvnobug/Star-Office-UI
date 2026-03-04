@@ -178,6 +178,7 @@ cloudflared tunnel --url http://127.0.0.1:18791
   - 回复完成后 **立刻**：`python3 set_state.py done "待命中，随时准备" --source chat`
   - 异常时：`python3 set_state.py err "处理失败，正在排查" --ttl 120 --source chat`
   - 命令型任务推荐用：`bash scripts/state_guard.sh --state syncing --detail "正在执行命令" -- <command>`（自动回 idle，避免漏切）
+  - 对话链路请按 `docs/CHAT_STATUS_INTEGRATION_TEMPLATE.md` 的 try/finally 模板接入（防止偶发不回待命）
 - 注意不要暴露你主人的内网地址或私有信息
 
 ---

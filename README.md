@@ -301,7 +301,7 @@ bash scripts/state_guard.sh --state syncing --detail "正在执行任务" -- <co
 
 这会在任务结束后自动回 idle，避免“漏切/不回待命”。
 
-更多见：`docs/CHAT_STATUS_REALTIME.md`
+更多见：`docs/CHAT_STATUS_REALTIME.md` 与 `docs/CHAT_STATUS_INTEGRATION_TEMPLATE.md`
 
 ### D.2 推送“秒级同步”建议（office-agent-push）
 
