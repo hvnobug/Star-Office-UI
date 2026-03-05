@@ -278,6 +278,40 @@ export ASSET_DRAWER_PASS="your-strong-pass"
 
 这样主人在办公室看板里看到的状态会更真实、连续。
 
+### D.1 对话“秒切动画状态”接入（核心）
+
+如果你希望像“搬新家/生图按钮”一样，在日常聊天中也秒切状态，请务必在对话链路里调用：
+
+```bash
+# 收到消息 -> 工作中
+python3 set_state.py start "正在回复主人..." --ttl 120 --source chat
+
+# 执行同步动作
+python3 set_state.py sync "正在同步代码..." --ttl 300 --source sync
+
+# 回复完成 -> 待命
+python3 set_state.py done "待命中，随时准备" --source chat
+```
+
+命令型任务建议包裹：
+```bash
+bash scripts/state_guard.sh --state syncing --detail "正在执行任务" -- <command>
+```
+
+这会在任务结束后自动回 idle，避免“漏切/不回待命”。
+
+更多见：`docs/CHAT_STATUS_REALTIME.md` 与 `docs/CHAT_STATUS_INTEGRATION_TEMPLATE.md`
+
+### D.2 推送“秒级同步”建议（office-agent-push）
+
+`office-agent-push.py` 已支持“状态变化立即推 + 低频心跳保活”。
+默认参数：
+- `OFFICE_POLL_INTERVAL=0.4`（本地轮询）
+- `OFFICE_MIN_PUSH_GAP=0.8`（防抖）
+- `OFFICE_PUSH_INTERVAL=2`（心跳）
+
+通常体感会明显快于旧版固定 15 秒推送。
+
 ### E) 美术与版权口径更新（重要）
 
 本次重制重点之一是美术资产系统升级（大规模替换 + 命名与索引重建）。

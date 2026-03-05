@@ -135,12 +135,20 @@ cloudflared tunnel --url http://127.0.0.1:18791
 
 如果有其他 OpenClaw 想加入你主人的办公室：
 
-### 步骤 A：告诉其他龙虾用 office-agent-push.py
+### 步骤 A：告诉其他龙虾用 office-agent-push.py（默认秒级同步）
 
 你可以让其他龙虾：
 1) 下载 `office-agent-push.py`（可以直接从你这个仓库拿）
 2) 让它调用 `join-agent` + 周期 `agent-push`
-3) 你主人那边就能看到它进办公室了
+3) 默认使用“状态变化立即推 + 心跳保活”，不再是旧版固定 15 秒慢推送
+4) 你主人那边就能看到它进办公室了
+
+推荐环境变量（开箱即用，通常不用改）：
+```bash
+OFFICE_POLL_INTERVAL=0.4
+OFFICE_MIN_PUSH_GAP=0.8
+OFFICE_PUSH_INTERVAL=2
+```
 
 ### 步骤 B：join key 说明
 
@@ -172,9 +180,23 @@ cloudflared tunnel --url http://127.0.0.1:18791
 
 - 尽量帮主人把“启动步骤”做完，让主人只负责“看”和“体验”
 - 如果主人要对外访问，优先用 Cloudflare Tunnel（最快最方便）
-- 状态切换应由你主动执行：
-  - 接任务前，先把自己状态切到“工作中”（如 `writing/researching/executing`），再开始工作；
-  - 完成任务后，先把自己状态切回“待命中（idle）”，再进入休息/等待下一任务。
+- 状态切换应由你主动执行（核心必做）：
+  - 收到主人消息后 **立刻**：`python3 set_state.py start "正在回复主人..." --ttl 120 --source chat`
+  - 执行 push/发布/同步时：`python3 set_state.py sync "正在同步中..." --ttl 300 --source sync`
+  - 回复完成后 **立刻**：`python3 set_state.py done "待命中，随时准备" --source chat`
+  - 异常时：`python3 set_state.py err "处理失败，正在排查" --ttl 120 --source chat`
+  - 命令型任务推荐用：`bash scripts/state_guard.sh --state syncing --detail "正在执行命令" -- <command>`（自动回 idle，避免漏切）
+  - 对话链路必须按 `docs/CHAT_STATUS_INTEGRATION_TEMPLATE.md` 的 try/finally 模板接入（防止偶发不回待命）
+
+### 9.1 给“安装龙虾”的硬性接入要求（必须执行）
+
+当你把本 Skill 丢给其他龙虾做安装时，要求它们必须做到：
+
+1) 所有对话链路都接入状态模板（收到消息先 start，回复后 done）
+2) 所有命令型操作都用 `scripts/state_guard.sh` 包裹（防漏切）
+3) `office-agent-push.py` 使用秒级同步参数（变化即推 + 心跳）
+
+如果它没做到这 3 条，就不算“安装完成”。
 - 注意不要暴露你主人的内网地址或私有信息
 
 ---

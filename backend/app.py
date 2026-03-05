@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Star Office UI - Backend State Service"""
 
-from flask import Flask, jsonify, send_from_directory, make_response, request, session
+from flask import Flask, jsonify, send_from_directory, make_response, request, session, g
+from werkzeug.exceptions import RequestEntityTooLarge
 from datetime import datetime, timedelta
 import json
 import os
@@ -12,8 +13,17 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
+import uuid
 from pathlib import Path
-from security_utils import is_production_mode, is_strong_secret, is_strong_drawer_pass
+from security_utils import (
+    is_production_mode,
+    is_strong_secret,
+    is_strong_drawer_pass,
+    parse_csv_set,
+    feature_enabled,
+    is_valid_bearer,
+)
 from memo_utils import get_yesterday_date_str, sanitize_content, extract_memo_from_file
 from store_utils import (
     load_agents_state as _store_load_agents_state,
@@ -80,10 +90,57 @@ app.config.update(
 
 # Guard join-agent critical section to enforce per-key concurrency under parallel requests
 join_lock = threading.Lock()
+# Guard local main-state file writes
+state_lock = threading.Lock()
 
 # Generate a version timestamp once at server startup for cache busting
 VERSION_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 ASSET_DRAWER_PASS_DEFAULT = os.getenv("ASSET_DRAWER_PASS", "1234")
+
+# Phase 2 hardening (non-breaking): optional write-endpoint bearer guard.
+# Default OFF to avoid changing existing behavior before explicit enable.
+WRITE_API_BEARER_ENABLED = feature_enabled("STAR_OFFICE_WRITE_API_BEARER_ENABLED", default=False)
+WRITE_API_TOKENS = parse_csv_set(os.getenv("STAR_OFFICE_WRITE_API_TOKENS", ""))
+PROTECTED_WRITE_PATHS = {
+    "/set_state",
+    "/join-agent",
+    "/leave-agent",
+    "/agent-push",
+    "/agent-approve",
+    "/agent-reject",
+}
+
+# Upload hardening (non-breaking default; affects only oversized uploads)
+MAX_UPLOAD_MB = int(os.getenv("STAR_OFFICE_MAX_UPLOAD_MB", "20"))
+MAX_UPLOAD_BYTES = max(1, MAX_UPLOAD_MB) * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+
+# Basic in-process rate limiter for sensitive write endpoints
+# Format: STAR_OFFICE_WRITE_RATE_LIMIT="60,60" => 60 requests / 60 seconds per IP+path
+_rate_limit_raw = (os.getenv("STAR_OFFICE_WRITE_RATE_LIMIT") or "60,60").strip()
+try:
+    _limit_count, _limit_window = [int(x.strip()) for x in _rate_limit_raw.split(",", 1)]
+except Exception:
+    _limit_count, _limit_window = 60, 60
+WRITE_RATE_LIMIT_COUNT = max(1, _limit_count)
+WRITE_RATE_LIMIT_WINDOW_SECONDS = max(1, _limit_window)
+_rate_buckets = {}
+_rate_lock = threading.Lock()
+
+# Optional read hardening for asset inventory/template endpoints (default OFF for compatibility)
+ASSET_READ_AUTH_ENABLED = feature_enabled("STAR_OFFICE_ASSET_READ_AUTH_ENABLED", default=False)
+
+# Background generation guard (non-breaking): avoid concurrent heavy generation jobs.
+BG_GENERATE_LOCK = threading.Lock()
+GEMINI_SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("STAR_OFFICE_GEMINI_TIMEOUT_SECONDS", "240"))
+GEMINI_PROMPT_MAX_CHARS = int(os.getenv("STAR_OFFICE_GEMINI_PROMPT_MAX_CHARS", "1200"))
+
+# Optional request logging (off by default, no behavior change)
+REQUEST_LOG_ENABLED = feature_enabled("STAR_OFFICE_REQUEST_LOG_ENABLED", default=False)
+REQUEST_LOG_PATH = os.getenv("STAR_OFFICE_REQUEST_LOG_PATH", os.path.join(ROOT_DIR, "request.log"))
+
+# Production strict mode: enforce all hardening toggles on startup when enabled.
+PROD_STRICT_MODE = feature_enabled("STAR_OFFICE_PROD_STRICT_MODE", default=False)
 
 if is_production_mode():
     hardening_errors = []
@@ -91,6 +148,15 @@ if is_production_mode():
         hardening_errors.append("FLASK_SECRET_KEY / STAR_OFFICE_SECRET is weak (need >=24 chars, non-default)")
     if not is_strong_drawer_pass(ASSET_DRAWER_PASS_DEFAULT):
         hardening_errors.append("ASSET_DRAWER_PASS is weak (do not use default 1234; recommend >=8 chars)")
+
+    if PROD_STRICT_MODE:
+        if not WRITE_API_BEARER_ENABLED:
+            hardening_errors.append("PROD_STRICT_MODE requires STAR_OFFICE_WRITE_API_BEARER_ENABLED=true")
+        if WRITE_API_BEARER_ENABLED and not WRITE_API_TOKENS:
+            hardening_errors.append("PROD_STRICT_MODE requires non-empty STAR_OFFICE_WRITE_API_TOKENS")
+        if not ASSET_READ_AUTH_ENABLED:
+            hardening_errors.append("PROD_STRICT_MODE requires STAR_OFFICE_ASSET_READ_AUTH_ENABLED=true")
+
     if hardening_errors:
         raise RuntimeError("Security hardening check failed in production mode: " + "; ".join(hardening_errors))
 
@@ -103,6 +169,119 @@ def _require_asset_editor_auth():
     if _is_asset_editor_authed():
         return None
     return jsonify({"ok": False, "code": "UNAUTHORIZED", "msg": "Asset editor auth required"}), 401
+
+
+def _extract_bearer_token() -> str:
+    h = (request.headers.get("Authorization") or "").strip()
+    if not h.lower().startswith("bearer "):
+        return ""
+    return h[7:].strip()
+
+
+def _mask_sensitive(value: str, keep: int = 4) -> str:
+    s = (value or "").strip()
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return ("*" * (len(s) - keep)) + s[-keep:]
+
+
+def _append_request_log_line(payload: dict):
+    try:
+        line = json.dumps(payload, ensure_ascii=False)
+        parent = os.path.dirname(os.path.abspath(REQUEST_LOG_PATH)) or "."
+        os.makedirs(parent, exist_ok=True)
+        with open(REQUEST_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _write_api_auth_ok() -> bool:
+    if not WRITE_API_BEARER_ENABLED:
+        return True
+    # Misconfiguration safety: enabled but no token configured -> reject all writes.
+    if not WRITE_API_TOKENS:
+        return False
+    token = _extract_bearer_token()
+    return is_valid_bearer(token, WRITE_API_TOKENS)
+
+
+def _require_asset_read_auth():
+    if not ASSET_READ_AUTH_ENABLED:
+        return None
+    # Allow either drawer session auth or bearer token auth.
+    if _is_asset_editor_authed() or _write_api_auth_ok():
+        return None
+    return jsonify({"ok": False, "code": "UNAUTHORIZED", "msg": "Asset read auth required"}), 401
+
+
+def _client_ip() -> str:
+    # Prefer reverse-proxy headers when present.
+    xff = (request.headers.get("X-Forwarded-For") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    xrip = (request.headers.get("X-Real-IP") or "").strip()
+    if xrip:
+        return xrip
+    return (request.remote_addr or "unknown").strip() or "unknown"
+
+
+def _check_rate_limit(path: str) -> tuple[bool, int]:
+    now = int(time.time())
+    key = f"{_client_ip()}::{path}"
+    with _rate_lock:
+        # Opportunistic cleanup to avoid unbounded bucket growth.
+        if len(_rate_buckets) > 5000:
+            expired_keys = [k for k, v in _rate_buckets.items() if now >= int(v.get("reset_at", 0))]
+            for k in expired_keys[:2000]:
+                _rate_buckets.pop(k, None)
+
+        item = _rate_buckets.get(key)
+        if not item or now >= item["reset_at"]:
+            _rate_buckets[key] = {"count": 1, "reset_at": now + WRITE_RATE_LIMIT_WINDOW_SECONDS}
+            return True, WRITE_RATE_LIMIT_WINDOW_SECONDS
+
+        if item["count"] >= WRITE_RATE_LIMIT_COUNT:
+            retry_after = max(1, item["reset_at"] - now)
+            return False, retry_after
+
+        item["count"] += 1
+        retry_after = max(1, item["reset_at"] - now)
+        return True, retry_after
+
+
+@app.before_request
+def enforce_write_api_auth_if_enabled():
+    # Request context baseline (for optional logging)
+    g.request_id = str(uuid.uuid4())
+    g.request_started_at = time.time()
+
+    if request.method != "POST":
+        return None
+    if request.path not in PROTECTED_WRITE_PATHS:
+        return None
+
+    allowed, retry_after = _check_rate_limit(request.path)
+    if not allowed:
+        resp = jsonify({"ok": False, "code": "RATE_LIMITED", "msg": "Too many requests"})
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(retry_after)
+        return resp
+
+    if _write_api_auth_ok():
+        return None
+    return jsonify({"ok": False, "code": "UNAUTHORIZED", "msg": "Write API auth required"}), 401
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_request_too_large(_e):
+    return jsonify({
+        "ok": False,
+        "code": "PAYLOAD_TOO_LARGE",
+        "msg": f"Upload exceeds limit ({MAX_UPLOAD_MB}MB)",
+    }), 413
 
 
 @app.after_request
@@ -120,6 +299,32 @@ def add_no_cache_headers(response):
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
+
+    # Optional request log (redacted)
+    if REQUEST_LOG_ENABLED:
+        try:
+            elapsed_ms = int((time.time() - float(getattr(g, "request_started_at", time.time()))) * 1000)
+        except Exception:
+            elapsed_ms = -1
+
+        ua = (request.headers.get("User-Agent") or "")[:180]
+        auth_header = (request.headers.get("Authorization") or "").strip()
+        auth_masked = ""
+        if auth_header.lower().startswith("bearer "):
+            auth_masked = "Bearer " + _mask_sensitive(auth_header[7:].strip(), keep=4)
+
+        _append_request_log_line({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "request_id": getattr(g, "request_id", ""),
+            "ip": _client_ip(),
+            "method": request.method,
+            "path": path,
+            "status": int(getattr(response, "status_code", 0) or 0),
+            "duration_ms": elapsed_ms,
+            "ua": ua,
+            "auth": auth_masked,
+        })
+
     return response
 
 # Default state
@@ -183,9 +388,33 @@ def load_state():
 
 
 def save_state(state: dict):
-    """Save state to file"""
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    """Save state to file (atomic, non-breaking behavior)."""
+    target = os.path.abspath(STATE_FILE)
+    parent = os.path.dirname(target) or "."
+    os.makedirs(parent, exist_ok=True)
+
+    with state_lock:
+        fd, tmp_path = tempfile.mkstemp(prefix="._tmp_state_", suffix=".json", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, target)
+            try:
+                dfd = os.open(parent, os.O_DIRECTORY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except Exception:
+                pass
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def ensure_electron_standalone_snapshot():
@@ -675,7 +904,13 @@ def _generate_rpg_background_to_webp(out_webp_path: str, width: int = 1280, heig
     env["GEMINI_API_KEY"] = api_key
 
     def _run_cmd(cmd_args):
-        return subprocess.run(cmd_args, capture_output=True, text=True, env=env, timeout=240)
+        return subprocess.run(
+            cmd_args,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=max(30, GEMINI_SUBPROCESS_TIMEOUT_SECONDS),
+        )
 
     def _is_model_unavailable_error(text: str) -> bool:
         low = (text or "").strip().lower()
@@ -1259,6 +1494,9 @@ def set_state_endpoint():
 
 @app.route("/assets/template.zip", methods=["GET"])
 def assets_template_download():
+    guard = _require_asset_read_auth()
+    if guard:
+        return guard
     if not os.path.exists(ASSET_TEMPLATE_ZIP):
         return jsonify({"ok": False, "msg": "模板包不存在，请先生成"}), 404
     return send_from_directory(ROOT_DIR, "assets-replace-template.zip", as_attachment=True)
@@ -1266,6 +1504,9 @@ def assets_template_download():
 
 @app.route("/assets/list", methods=["GET"])
 def assets_list():
+    guard = _require_asset_read_auth()
+    if guard:
+        return guard
     items = []
     for p in FRONTEND_PATH.rglob("*"):
         if not p.is_file():
@@ -1302,9 +1543,13 @@ def assets_generate_rpg_background():
     guard = _require_asset_editor_auth()
     if guard:
         return guard
+    if not BG_GENERATE_LOCK.acquire(blocking=False):
+        return jsonify({"ok": False, "code": "GEN_BUSY", "msg": "已有生成任务进行中，请稍后重试"}), 429
     try:
         req = request.get_json(silent=True) or {}
         custom_prompt = (req.get("prompt") or "").strip() if isinstance(req, dict) else ""
+        if len(custom_prompt) > GEMINI_PROMPT_MAX_CHARS:
+            custom_prompt = custom_prompt[:GEMINI_PROMPT_MAX_CHARS]
         speed_mode = (req.get("speed_mode") or "quality").strip().lower() if isinstance(req, dict) else "quality"
         if speed_mode not in {"fast", "quality"}:
             speed_mode = "fast"
@@ -1357,6 +1602,11 @@ def assets_generate_rpg_background():
                 "detail": detail,
             }), 400
         return jsonify({"ok": False, "msg": msg}), 500
+    finally:
+        try:
+            BG_GENERATE_LOCK.release()
+        except Exception:
+            pass
 
 
 @app.route("/assets/restore-reference-background", methods=["POST"])
@@ -1965,6 +2215,7 @@ if __name__ == "__main__":
     print(f"Listening on: http://0.0.0.0:{backend_port}")
     mode = "production" if is_production_mode() else "development"
     print(f"Mode: {mode}")
+    print(f"Prod strict mode: {'ON' if PROD_STRICT_MODE else 'OFF'}")
     if is_production_mode():
         print("Security hardening: ENABLED (strict checks)")
     else:
